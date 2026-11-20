@@ -2,9 +2,12 @@ package exec
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"gssh/internal/protocol"
 )
@@ -21,6 +24,80 @@ func TestLocalExecSimple(t *testing.T) {
 	}
 	if result.ExitCode != 0 {
 		t.Errorf("ExitCode = %d, want 0", result.ExitCode)
+	}
+}
+
+func TestLocalExecStdin(t *testing.T) {
+	e := NewExecutor(nil)
+	result, err := e.ExecLocalWithCwdInput("cat", "", 0, nil, []byte("hello stdin\n"))
+	if err != nil {
+		t.Fatalf("ExecLocalWithCwdInput failed: %v", err)
+	}
+	if result.Stdout != "hello stdin\n" {
+		t.Fatalf("stdout = %q", result.Stdout)
+	}
+}
+
+func TestLocalExecWithCwd(t *testing.T) {
+	e := NewExecutor(nil)
+	dir := t.TempDir()
+	result, err := e.ExecLocalWithCwd("pwd", dir, 0, nil)
+	if err != nil {
+		t.Fatalf("ExecLocalWithCwd failed: %v", err)
+	}
+	if got := strings.TrimSpace(result.Stdout); got != dir {
+		t.Fatalf("cwd = %q, want %q", got, dir)
+	}
+}
+
+func TestLocalStreamCancellationStopsQuietCommand(t *testing.T) {
+	e := NewExecutor(nil)
+	cancel := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.ExecLocalStreamWithCwdCancel("sleep 30", "", 0, nil, io.Discard, io.Discard, cancel)
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	close(cancel)
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "cancel") {
+			t.Fatalf("error = %v, want cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("quiet command did not stop after cancellation")
+	}
+}
+
+func TestWithWorkingDirPreservesTrailingComment(t *testing.T) {
+	dir := t.TempDir()
+	result, err := runLocalInput(withWorkingDir("printf ok # trailing comment", dir), 0, nil, nil)
+	if err != nil {
+		t.Fatalf("runLocalInput failed: %v", err)
+	}
+	if result.Stdout != "ok" {
+		t.Fatalf("stdout = %q, want %q", result.Stdout, "ok")
+	}
+}
+
+type captureWriteCloser struct {
+	bytes.Buffer
+	closed bool
+}
+
+func (w *captureWriteCloser) Close() error { w.closed = true; return nil }
+
+func TestWritePasswordAndInputWithoutPassword(t *testing.T) {
+	w := &captureWriteCloser{}
+	if err := writePasswordAndInput(w, "", []byte("payload")); err != nil {
+		t.Fatalf("writePasswordAndInput failed: %v", err)
+	}
+	if got := w.String(); got != "payload" {
+		t.Fatalf("captured input = %q, want %q", got, "payload")
+	}
+	if !w.closed {
+		t.Fatal("stdin writer was not closed")
 	}
 }
 
@@ -241,3 +318,19 @@ func TestExecLocalStreamPipe(t *testing.T) {
 		t.Errorf("exitCode = %d, want 0", exitCode)
 	}
 }
+
+func TestRunLocalStreamKillsProcessWhenWriterDisconnects(t *testing.T) {
+	w := &failingWriter{}
+	start := time.Now()
+	code, err := runLocalNormalStream("printf boom; sleep 10", 0, w, io.Discard)
+	if time.Since(start) > 3*time.Second {
+		t.Fatal("stream execution did not stop after writer failure")
+	}
+	if err != nil && code == 0 {
+		t.Fatalf("unexpected successful exit after writer failure: code=%d err=%v", code, err)
+	}
+}
+
+type failingWriter struct{}
+
+func (*failingWriter) Write([]byte) (int, error) { return 0, errors.New("client disconnected") }

@@ -74,3 +74,23 @@ func TestDefaultKeyAuthMethodsSkipsMissingAndBadKeys(t *testing.T) {
 		t.Fatalf("expected unparseable key to be skipped, got %d methods", len(got))
 	}
 }
+
+func TestSplitDestinationPort(t *testing.T) {
+	tests := []struct {
+		in   string
+		host string
+		port int
+		ok   bool
+	}{
+		{"bastion:2222", "bastion", 2222, true},
+		{"[::1]:2200", "::1", 2200, true},
+		{"::1", "::1", 0, false},
+		{"bastion:http", "bastion:http", 0, false},
+	}
+	for _, tt := range tests {
+		h, p, ok := splitDestinationPort(tt.in)
+		if h != tt.host || p != tt.port || ok != tt.ok {
+			t.Errorf("splitDestinationPort(%q) = (%q, %d, %v), want (%q, %d, %v)", tt.in, h, p, ok, tt.host, tt.port, tt.ok)
+		}
+	}
+}

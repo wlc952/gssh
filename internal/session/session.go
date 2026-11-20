@@ -3,6 +3,7 @@ package session
 import (
 	"fmt"
 	"os/user"
+	"sort"
 	"sync"
 	"time"
 
@@ -44,6 +45,7 @@ type SSHSession struct {
 	Port      int
 	Password  string // in-memory only, not persisted
 	KeyPath   string
+	ProxyJump string
 	Status    Status
 	Client    *sshclient.Client
 	CreatedAt time.Time
@@ -223,19 +225,28 @@ type Manager struct {
 	defaultName string             // default session name
 	mu          sync.RWMutex
 	// connect dials SSH connections; replaceable in tests via SetConnectFunc.
-	connect func(user, host string, port int, auth sshclient.AuthConfig) (*sshclient.Client, error)
+	connect func(user, host string, port int, auth sshclient.AuthConfig, timeout time.Duration) (*sshclient.Client, error)
 }
 
 // NewManager creates a new session manager.
 func NewManager() *Manager {
 	return &Manager{
 		sessions: make(map[string]Session),
-		connect:  sshclient.Connect,
+		connect: func(user, host string, port int, auth sshclient.AuthConfig, timeout time.Duration) (*sshclient.Client, error) {
+			return sshclient.ConnectWithTimeout(user, host, port, auth, timeout)
+		},
 	}
 }
 
 // SetConnectFunc overrides the SSH dial function. Intended for tests.
 func (m *Manager) SetConnectFunc(f func(user, host string, port int, auth sshclient.AuthConfig) (*sshclient.Client, error)) {
+	m.connect = func(user, host string, port int, auth sshclient.AuthConfig, timeout time.Duration) (*sshclient.Client, error) {
+		return f(user, host, port, auth)
+	}
+}
+
+// SetConnectFuncWithTimeout overrides dialing for tests and custom transports.
+func (m *Manager) SetConnectFuncWithTimeout(f func(user, host string, port int, auth sshclient.AuthConfig, timeout time.Duration) (*sshclient.Client, error)) {
 	m.connect = f
 }
 
@@ -244,7 +255,16 @@ func (m *Manager) SetConnectFunc(f func(user, host string, port int, auth sshcli
 const awaitTimeout = 20 * time.Second
 
 // ConnectSSH creates a new SSH session or returns an existing one.
-func (m *Manager) ConnectSSH(name, user, host string, port int, password, keyPath string) (*SSHSession, error) {
+func (m *Manager) ConnectSSH(name, user, host string, port int, password, keyPath string, proxyJump ...string) (*SSHSession, error) {
+	return m.ConnectSSHWithTimeout(name, user, host, port, password, keyPath, 0, proxyJump...)
+}
+
+// ConnectSSHWithTimeout creates a session using the requested SSH handshake timeout.
+func (m *Manager) ConnectSSHWithTimeout(name, user, host string, port int, password, keyPath string, timeoutSeconds int, proxyJump ...string) (*SSHSession, error) {
+	jump := ""
+	if len(proxyJump) > 0 {
+		jump = proxyJump[0]
+	}
 	// Auto-generate name if not provided
 	if name == "" {
 		name = fmt.Sprintf("%s@%s", user, host)
@@ -285,7 +305,7 @@ func (m *Manager) ConnectSSH(name, user, host string, port int, password, keyPat
 			if keyPath != "" {
 				sshSess.SetKeyPath(keyPath)
 			}
-			if err := m.reconnectSSH(sshSess); err != nil {
+			if err := m.reconnectSSHWithTimeout(sshSess, timeoutSeconds); err != nil {
 				return nil, err
 			}
 			return sshSess, nil
@@ -303,6 +323,7 @@ func (m *Manager) ConnectSSH(name, user, host string, port int, password, keyPat
 		Port:      port,
 		Password:  password,
 		KeyPath:   keyPath,
+		ProxyJump: jump,
 		Status:    StatusConnecting,
 		CreatedAt: time.Now(),
 	}
@@ -312,7 +333,7 @@ func (m *Manager) ConnectSSH(name, user, host string, port int, password, keyPat
 	m.mu.Unlock()
 
 	// Connect outside of Manager lock
-	client, err := m.connect(user, host, port, sshclient.AuthConfig{Password: password, KeyPath: keyPath})
+	client, err := m.connect(user, host, port, sshclient.AuthConfig{Password: password, KeyPath: keyPath, ProxyJump: jump}, time.Duration(timeoutSeconds)*time.Second)
 	if err != nil {
 		// Wake AwaitClient waiters before removing the session.
 		sess.SetStatus(StatusOffline)
@@ -406,6 +427,9 @@ func (m *Manager) List() []Session {
 	for _, s := range m.sessions {
 		result = append(result, s)
 	}
+	// Map iteration order is deliberately randomized. Stable ordering makes
+	// `gssh list` readable and keeps JSON output deterministic for agents.
+	sort.Slice(result, func(i, j int) bool { return result[i].GetName() < result[j].GetName() })
 	return result
 }
 
@@ -499,13 +523,18 @@ func (m *Manager) KillAll() {
 }
 
 // RegisterOfflineSession adds an SSH session in offline state (for state restoration).
-func (m *Manager) RegisterOfflineSession(name, user, host string, port int, keyPath string, createdAt time.Time) {
+func (m *Manager) RegisterOfflineSession(name, user, host string, port int, keyPath string, createdAt time.Time, proxyJump ...string) {
+	jump := ""
+	if len(proxyJump) > 0 {
+		jump = proxyJump[0]
+	}
 	sess := &SSHSession{
 		Name:      name,
 		Host:      host,
 		User:      user,
 		Port:      port,
 		KeyPath:   keyPath,
+		ProxyJump: jump,
 		Status:    StatusOffline,
 		CreatedAt: createdAt,
 	}
@@ -540,6 +569,12 @@ func (m *Manager) Reconnect(name string) (*SSHSession, error) {
 // --- Internal helpers ---
 
 func (m *Manager) reconnectSSH(sess *SSHSession) error {
+	return m.reconnectSSHWithTimeout(sess, 0)
+}
+
+// reconnectSSHWithTimeout restores a session using the requested SSH
+// connection/handshake timeout. A zero timeout uses the SSH client's default.
+func (m *Manager) reconnectSSHWithTimeout(sess *SSHSession, timeoutSeconds int) error {
 	// Serialize reconnect attempts: without this, two concurrent paths
 	// (restore goroutine, monitor, use, connect-dedup) could both dial and
 	// the loser's client would be overwritten and leaked.
@@ -557,10 +592,15 @@ func (m *Manager) reconnectSSH(sess *SSHSession) error {
 		oldClient.Close()
 	}
 
+	var timeout time.Duration
+	if timeoutSeconds > 0 {
+		timeout = time.Duration(timeoutSeconds) * time.Second
+	}
 	client, err := m.connect(sess.User, sess.Host, sess.Port, sshclient.AuthConfig{
-		Password: sess.GetPassword(),
-		KeyPath:  sess.GetKeyPath(),
-	})
+		Password:  sess.GetPassword(),
+		KeyPath:   sess.GetKeyPath(),
+		ProxyJump: sess.ProxyJump,
+	}, timeout)
 	if err != nil {
 		sess.SetStatus(StatusOffline)
 		return err

@@ -49,6 +49,19 @@ func (r *safeRoot) openFile(relPath string, perm os.FileMode) (*os.File, error) 
 	return os.OpenFile(full, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm.Perm())
 }
 
+// openFileResume opens an existing destination without truncating it.
+func (r *safeRoot) openFileResume(relPath string, perm os.FileMode) (*os.File, error) {
+	cleanRel, err := cleanRelPath(relPath)
+	if err != nil || cleanRel == "" {
+		return nil, fmt.Errorf("invalid destination relative path: %s", relPath)
+	}
+	full := filepath.Join(r.path, cleanRel)
+	if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+		return nil, err
+	}
+	return os.OpenFile(full, os.O_CREATE|os.O_WRONLY, perm.Perm())
+}
+
 // ensureDir creates relPath (and any missing parents) under the root.
 func (r *safeRoot) ensureDir(relPath string, mode os.FileMode) error {
 	cleanRel, err := cleanRelPath(relPath)

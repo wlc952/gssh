@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -22,6 +24,29 @@ import (
 	"gssh/pkg/imsg"
 )
 
+// requestContext extracts optional correlation fields from any request
+// payload. Older clients do not send task_id; those requests receive a
+// generated id in error responses so failures remain diagnosable.
+func requestContext(payload []byte) (sessionName, taskID string) {
+	var v struct {
+		Name   string `json:"name"`
+		TaskID string `json:"task_id"`
+	}
+	_ = json.Unmarshal(payload, &v)
+	if v.TaskID == "" {
+		var b [8]byte
+		if _, err := rand.Read(b[:]); err == nil {
+			v.TaskID = hex.EncodeToString(b[:])
+		}
+	}
+	return v.Name, v.TaskID
+}
+
+func marshalRPCError(err error, sessionName, taskID string) []byte {
+	payload, _ := json.Marshal(protocol.NewErrorPayload(err, sessionName, taskID))
+	return payload
+}
+
 // Server is the core daemon that listens on a Unix socket and dispatches commands.
 type Server struct {
 	socketPath string
@@ -38,8 +63,15 @@ type Server struct {
 	stopOnce   sync.Once
 	connMu     sync.Mutex
 	activeConn map[net.Conn]struct{}
+	taskMu     sync.Mutex
+	activeTask map[string]taskHandle
 	acceptMu   sync.Mutex
 	stopping   bool
+}
+
+type taskHandle struct {
+	conn   net.Conn
+	cancel chan struct{}
 }
 
 // NewServer creates a new server instance.
@@ -56,6 +88,7 @@ func NewServer(socketPath string) *Server {
 		audit:      audit.NewLogger(),
 		shutdown:   make(chan struct{}),
 		activeConn: make(map[net.Conn]struct{}),
+		activeTask: make(map[string]taskHandle),
 	}
 
 	// Reconnect monitor uses the actual forwards service.
@@ -188,13 +221,26 @@ func (s *Server) handleConn(conn net.Conn) {
 
 		// Streaming exec: the handler writes multiple frames directly to conn
 		// before returning, so it bypasses the single-response dispatch loop.
+		sessionName, taskID := requestContext(msg.Payload)
 		if msg.Type == protocol.MsgExecStream {
 			var params protocol.ExecParams
 			if err := protocol.DecodePayload(msg.Payload, &params); err != nil {
-				errPayload, _ := json.Marshal(protocol.ErrorPayload{Code: -32000, Message: err.Error()})
+				errPayload := marshalRPCError(err, sessionName, taskID)
 				imsg.WriteMessage(conn, imsg.NewImsg(protocol.MsgError, errPayload))
 			} else {
-				s.handleExecStream(conn, params)
+				cancel, regErr := s.registerTask(params.TaskID, conn)
+				if regErr != nil {
+					errPayload := marshalRPCError(regErr, sessionName, taskID)
+					_ = imsg.WriteMessage(conn, imsg.NewImsg(protocol.MsgError, errPayload))
+					continue
+				}
+				done := make(chan struct{})
+				monitorDone := make(chan struct{})
+				go monitorConnDisconnect(conn, cancel, done, monitorDone)
+				s.handleExecStreamCancelable(conn, params, cancel)
+				close(done)
+				<-monitorDone
+				s.unregisterTask(params.TaskID, conn)
 			}
 			continue
 		}
@@ -202,10 +248,22 @@ func (s *Server) handleConn(conn net.Conn) {
 		if msg.Type == protocol.MsgLocalExecStream {
 			var params protocol.LocalExecParams
 			if err := protocol.DecodePayload(msg.Payload, &params); err != nil {
-				errPayload, _ := json.Marshal(protocol.ErrorPayload{Code: -32000, Message: err.Error()})
+				errPayload := marshalRPCError(err, sessionName, taskID)
 				imsg.WriteMessage(conn, imsg.NewImsg(protocol.MsgError, errPayload))
 			} else {
-				s.handleLocalExecStream(conn, params)
+				cancel, regErr := s.registerTask(params.TaskID, conn)
+				if regErr != nil {
+					errPayload := marshalRPCError(regErr, sessionName, taskID)
+					_ = imsg.WriteMessage(conn, imsg.NewImsg(protocol.MsgError, errPayload))
+					continue
+				}
+				done := make(chan struct{})
+				monitorDone := make(chan struct{})
+				go monitorConnDisconnect(conn, cancel, done, monitorDone)
+				s.handleLocalExecStreamCancelable(conn, params, cancel)
+				close(done)
+				<-monitorDone
+				s.unregisterTask(params.TaskID, conn)
 			}
 			continue
 		}
@@ -213,17 +271,14 @@ func (s *Server) handleConn(conn net.Conn) {
 		response, err := s.dispatch(msg)
 		if err != nil {
 			// Send error response
-			errPayload, _ := json.Marshal(protocol.ErrorPayload{Code: -32000, Message: err.Error()})
+			errPayload := marshalRPCError(err, sessionName, taskID)
 			response = imsg.NewImsg(protocol.MsgError, errPayload)
 		}
 
 		// Guard against oversized payloads (e.g. huge buffered exec output):
 		// fail with a clear error instead of dying mid-write or dropping the conn.
 		if len(response.Payload) > imsg.MaxPayloadSize {
-			errPayload, _ := json.Marshal(protocol.ErrorPayload{
-				Code:    -32000,
-				Message: fmt.Sprintf("response exceeds %d bytes; re-run with --stream for large output", imsg.MaxPayloadSize),
-			})
+			errPayload := marshalRPCError(fmt.Errorf("response exceeds %d bytes; re-run with --stream for large output", imsg.MaxPayloadSize), sessionName, taskID)
 			response = imsg.NewImsg(protocol.MsgError, errPayload)
 		}
 
@@ -235,6 +290,27 @@ func (s *Server) handleConn(conn net.Conn) {
 
 func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 	switch msg.Type {
+	case protocol.MsgCancel:
+		var params protocol.CancelParams
+		if err := protocol.DecodePayload(msg.Payload, &params); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		if params.TaskID == "" {
+			return nil, fmt.Errorf("task_id is required")
+		}
+		if s.cancelTask(params.TaskID) {
+			return imsg.NewImsg(protocol.MsgResult, []byte(`{"status":"cancelling"}`)), nil
+		}
+		return nil, fmt.Errorf("task %q not found or already finished", params.TaskID)
+	case protocol.MsgTaskList:
+		s.taskMu.Lock()
+		tasks := make([]protocol.TaskInfo, 0, len(s.activeTask))
+		for id := range s.activeTask {
+			tasks = append(tasks, protocol.TaskInfo{TaskID: id, Status: "running"})
+		}
+		s.taskMu.Unlock()
+		payload, _ := protocol.EncodePayload(tasks)
+		return imsg.NewImsg(protocol.MsgResult, payload), nil
 	case protocol.MsgPing:
 		return imsg.NewImsg(protocol.MsgPong, []byte(`{"status":"ok"}`)), nil
 
@@ -243,7 +319,10 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 		if err := protocol.DecodePayload(msg.Payload, &params); err != nil {
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
-		sess, err := s.sessions.ConnectSSH(params.Name, params.User, params.Host, params.Port, params.Password, params.KeyPath)
+		if params.Timeout < 0 {
+			return nil, fmt.Errorf("invalid connection timeout %d: must be zero or positive seconds", params.Timeout)
+		}
+		sess, err := s.sessions.ConnectSSHWithTimeout(params.Name, params.User, params.Host, params.Port, params.Password, params.KeyPath, params.Timeout, params.ProxyJump)
 		if err != nil {
 			s.audit.Log(audit.Entry{Action: "connect", Result: "error", Detail: err.Error()})
 			return nil, err
@@ -286,7 +365,7 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 		if err := protocol.DecodePayload(msg.Payload, &params); err != nil {
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
-		result, err := s.executor.Exec(params.Name, params.Command, params.Timeout, &params.Sudo)
+		result, err := s.executor.ExecWithCwdInput(params.Name, params.Command, params.Cwd, params.Timeout, &params.Sudo, params.Stdin)
 		if err != nil {
 			s.logExecAudit(params.Name, params.Command, err, nil)
 			return nil, err
@@ -300,7 +379,7 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 		if err := protocol.DecodePayload(msg.Payload, &params); err != nil {
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
-		result, err := s.executor.ExecLocal(params.Command, params.Timeout, &params.Sudo)
+		result, err := s.executor.ExecLocalWithCwdInput(params.Command, params.Cwd, params.Timeout, &params.Sudo, params.Stdin)
 		if err != nil {
 			s.logExecAudit("", params.Command, err, nil)
 			return nil, err
@@ -514,7 +593,7 @@ func (s *Server) restoreState() {
 		// agent runs `gssh use <name> --pswd password`.
 		s.sessions.RegisterOfflineSession(
 			state.Name, state.User, state.Host, state.Port,
-			state.KeyPath, time.Unix(state.CreatedAt, 0),
+			state.KeyPath, time.Unix(state.CreatedAt, 0), state.ProxyJump,
 		)
 		// state.KeyPath check keeps pre-auto_reconnect state files working.
 		if state.AutoReconnect || state.KeyPath != "" {
@@ -582,6 +661,89 @@ func (w *chunkWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func (s *Server) registerTask(id string, conn net.Conn) (chan struct{}, error) {
+	cancel := make(chan struct{})
+	if id == "" {
+		return cancel, nil
+	}
+	s.taskMu.Lock()
+	if _, exists := s.activeTask[id]; exists {
+		s.taskMu.Unlock()
+		return nil, fmt.Errorf("task ID %q is already active", id)
+	}
+	s.activeTask[id] = taskHandle{conn: conn, cancel: cancel}
+	s.taskMu.Unlock()
+	return cancel, nil
+}
+
+func (s *Server) unregisterTask(id string, conn net.Conn) {
+	if id == "" {
+		return
+	}
+	s.taskMu.Lock()
+	if current, ok := s.activeTask[id]; ok && current.conn == conn {
+		delete(s.activeTask, id)
+	}
+	s.taskMu.Unlock()
+}
+
+func (s *Server) cancelTask(id string) bool {
+	s.taskMu.Lock()
+	handle, ok := s.activeTask[id]
+	if ok {
+		delete(s.activeTask, id)
+	}
+	s.taskMu.Unlock()
+	if !ok {
+		return false
+	}
+	// Closing the stream connection makes its writers return an error. The
+	// executor then terminates the local process group or SSH session.
+	closeCancel(handle.cancel)
+	_ = handle.conn.Close()
+	return true
+}
+
+// monitorConnDisconnect watches an otherwise idle streaming connection for
+// client closure. Streaming handlers are busy writing output and therefore do
+// not read from the connection; without this watcher a quiet command (for
+// example, "sleep 60") would keep running after the client disappeared.
+// Short read deadlines let us poll for completion without permanently
+// affecting the connection's normal read loop.
+func monitorConnDisconnect(conn net.Conn, cancel chan struct{}, done <-chan struct{}, monitorDone chan<- struct{}) {
+	defer func() {
+		_ = conn.SetReadDeadline(time.Time{})
+		close(monitorDone)
+	}()
+	buf := make([]byte, 1)
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		_, err := conn.Read(buf)
+		if err == nil {
+			// No request is expected while a stream is active. Ignore any
+			// incidental byte and continue watching for closure.
+			continue
+		}
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			continue
+		}
+		closeCancel(cancel)
+		return
+	}
+}
+
+// closeCancel closes a task cancellation channel exactly once. Cancellation
+// may race between an explicit gssh cancel request and connection teardown.
+func closeCancel(ch chan struct{}) {
+	defer func() { _ = recover() }()
+	close(ch)
+}
+
 // sendStreamEnd writes a MsgStreamEnd frame to the connection.
 func sendStreamEnd(conn net.Conn, exitCode int, execErr error) {
 	end := protocol.StreamEnd{ExitCode: exitCode}
@@ -593,21 +755,29 @@ func sendStreamEnd(conn net.Conn, exitCode int, execErr error) {
 }
 
 func (s *Server) handleExecStream(conn net.Conn, params protocol.ExecParams) {
+	s.handleExecStreamCancelable(conn, params, nil)
+}
+
+func (s *Server) handleExecStreamCancelable(conn net.Conn, params protocol.ExecParams, cancel <-chan struct{}) {
 	mu := &sync.Mutex{}
 	stdoutW := &chunkWriter{conn: conn, stream: "stdout", mu: mu}
 	stderrW := &chunkWriter{conn: conn, stream: "stderr", mu: mu}
 
-	exitCode, execErr := s.executor.ExecStream(params.Name, params.Command, params.Timeout, &params.Sudo, stdoutW, stderrW)
+	exitCode, execErr := s.executor.ExecStreamWithCwdCancel(params.Name, params.Command, params.Cwd, params.Timeout, &params.Sudo, stdoutW, stderrW, cancel)
 	s.logExecAudit(params.Name, params.Command, execErr, &protocol.ExecResult{ExitCode: exitCode})
 	sendStreamEnd(conn, exitCode, execErr)
 }
 
 func (s *Server) handleLocalExecStream(conn net.Conn, params protocol.LocalExecParams) {
+	s.handleLocalExecStreamCancelable(conn, params, nil)
+}
+
+func (s *Server) handleLocalExecStreamCancelable(conn net.Conn, params protocol.LocalExecParams, cancel <-chan struct{}) {
 	mu := &sync.Mutex{}
 	stdoutW := &chunkWriter{conn: conn, stream: "stdout", mu: mu}
 	stderrW := &chunkWriter{conn: conn, stream: "stderr", mu: mu}
 
-	exitCode, execErr := s.executor.ExecLocalStream(params.Command, params.Timeout, &params.Sudo, stdoutW, stderrW)
+	exitCode, execErr := s.executor.ExecLocalStreamWithCwdCancel(params.Command, params.Cwd, params.Timeout, &params.Sudo, stdoutW, stderrW, cancel)
 	s.logExecAudit("", params.Command, execErr, &protocol.ExecResult{ExitCode: exitCode})
 	sendStreamEnd(conn, exitCode, execErr)
 }

@@ -22,6 +22,19 @@ const rpcTimeout = 10 * time.Second
 // commands that may establish a connection (connect, use-with-reconnect).
 const connectRPCTimeout = 30 * time.Second
 
+// connectRPCDeadline gives the RPC enough time for the requested SSH
+// handshake plus a small response margin. A zero timeout retains the default.
+func connectRPCDeadline(timeoutSeconds int) time.Duration {
+	if timeoutSeconds <= 0 {
+		return connectRPCTimeout
+	}
+	deadline := time.Duration(timeoutSeconds)*time.Second + socketDeadlineBuffer
+	if deadline < connectRPCTimeout {
+		return connectRPCTimeout
+	}
+	return deadline
+}
+
 // socketDeadlineBuffer is the extra time added on top of the user-specified
 // command timeout to give the server room to finish and respond before the
 // client socket deadline fires.
@@ -30,6 +43,17 @@ const socketDeadlineBuffer = 30 * time.Second
 // daemonReadyTimeout is how long to wait for a freshly spawned daemon to
 // accept connections.
 const daemonReadyTimeout = 5 * time.Second
+
+// RPCError preserves the daemon's structured error envelope while remaining
+// printable through the existing CLI error path.
+type RPCError struct{ Payload protocol.ErrorPayload }
+
+func (e *RPCError) Error() string {
+	if e == nil {
+		return "RPC error"
+	}
+	return fmt.Sprintf("RPC error: %s", e.Payload.Message)
+}
 
 // dialOnce attempts one connection to the daemon, validating the socket and
 // verifying peer credentials.
@@ -183,7 +207,7 @@ func sendRequestWithTimeout(method uint16, params interface{}, deadline time.Dur
 		if err := json.Unmarshal(resp.Payload, &errPayload); err != nil {
 			return nil, fmt.Errorf("RPC error (unparseable)")
 		}
-		return nil, fmt.Errorf("RPC error: %s", errPayload.Message)
+		return nil, &RPCError{Payload: errPayload}
 	}
 
 	return resp.Payload, nil
@@ -252,7 +276,7 @@ func sendStreamRequest(method uint16, params interface{}, cmdTimeoutSecs int) er
 			if err := json.Unmarshal(msg.Payload, &errPayload); err != nil {
 				return fmt.Errorf("RPC error (unparseable)")
 			}
-			return fmt.Errorf("RPC error: %s", errPayload.Message)
+			return &RPCError{Payload: errPayload}
 
 		default:
 			return fmt.Errorf("unexpected message type during stream: %d", msg.Type)

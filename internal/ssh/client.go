@@ -19,14 +19,17 @@ import (
 // Client wraps an SSH client connection.
 type Client struct {
 	GoClient *ssh.Client
+	// upstream is held open when this client is connected through ProxyJump.
+	upstream *Client
 	mu       sync.Mutex
 	probing  bool
 }
 
 // AuthConfig holds authentication parameters.
 type AuthConfig struct {
-	Password string
-	KeyPath  string
+	Password  string
+	KeyPath   string
+	ProxyJump string
 }
 
 // Connect establishes an SSH connection using the given auth config.
@@ -40,6 +43,105 @@ type AuthConfig struct {
 // Password goes first when explicitly provided: offering a dozen agent keys
 // before the password can trip the server's MaxAuthTries limit.
 func Connect(user, host string, port int, auth AuthConfig) (*Client, error) {
+	return ConnectWithTimeout(user, host, port, auth, 10*time.Second)
+}
+
+// ConnectWithTimeout establishes an SSH connection with an explicit handshake
+// timeout. A zero or negative timeout uses the default (10 seconds).
+func ConnectWithTimeout(user, host string, port int, auth AuthConfig, timeout time.Duration) (*Client, error) {
+	if auth.ProxyJump != "" {
+		jumpUser, jumpHost := user, auth.ProxyJump
+		if i := strings.LastIndex(jumpHost, "@"); i >= 0 {
+			jumpUser, jumpHost = jumpHost[:i], jumpHost[i+1:]
+		}
+		jumpPort := 22
+		jumpPortExplicit := false
+		// ProxyJump destinations may include an optional port (for example
+		// user@bastion:2222). Strip it before resolving SSH config aliases and
+		// dialing; otherwise the port becomes part of the hostname.
+		if h, p, ok := splitDestinationPort(jumpHost); ok {
+			jumpHost, jumpPort = h, p
+			jumpPortExplicit = true
+		} else if strings.Count(jumpHost, ":") == 1 {
+			// A single colon denotes the host:port form. Reject malformed or
+			// out-of-range ports instead of passing them to net.JoinHostPort,
+			// which would produce a confusing hostname such as "host:http".
+			return nil, fmt.Errorf("invalid ProxyJump port in %q", jumpHost)
+		}
+		jumpAuth := auth
+		jumpAuth.ProxyJump = ""
+		if jc, _ := ResolveHostConfig(jumpHost); jc.HostName != "" || jc.User != "" || jc.Port != 0 || jc.IdentityFile != "" {
+			if jc.User != "" {
+				jumpUser = jc.User
+			}
+			if jc.HostName != "" {
+				jumpHost = jc.HostName
+			}
+			if jc.Port != 0 && !jumpPortExplicit {
+				jumpPort = jc.Port
+			}
+			if jc.IdentityFile != "" {
+				jumpAuth.KeyPath = jc.IdentityFile
+			}
+			return ConnectWithProxyJump(user, host, port, auth, timeout, jumpUser, jumpHost, jumpPort, jumpAuth)
+		}
+		base := auth
+		base.ProxyJump = ""
+		return ConnectWithProxyJump(user, host, port, base, timeout, jumpUser, jumpHost, jumpPort, jumpAuth)
+	}
+	return connectWithTimeout(user, host, port, auth, timeout, nil)
+}
+
+// splitDestinationPort extracts an explicit numeric port from a host name.
+// It accepts bracketed IPv6 ([::1]:2222) and the common host:port form while
+// leaving unbracketed IPv6 literals and non-numeric suffixes untouched.
+func splitDestinationPort(dest string) (string, int, bool) {
+	if h, p, err := net.SplitHostPort(dest); err == nil {
+		if n, err := strconv.Atoi(p); err == nil && n > 0 && n <= 65535 {
+			return h, n, true
+		}
+	}
+	if strings.Count(dest, ":") == 1 {
+		parts := strings.SplitN(dest, ":", 2)
+		if n, err := strconv.Atoi(parts[1]); err == nil && n > 0 && n <= 65535 {
+			return parts[0], n, true
+		}
+	}
+	return dest, 0, false
+}
+
+// ConnectWithProxyJump connects to host through a single SSH jump host.
+// An optional final AuthConfig configures authentication for the jump itself;
+// when omitted, auth is reused. jumpUser may be empty (in which case user is
+// used), and jumpPort may be zero (22 is used). The returned client owns the
+// jump connection and closes it with Close.
+func ConnectWithProxyJump(user, host string, port int, auth AuthConfig, timeout time.Duration, jumpUser, jumpHost string, jumpPort int, jumpAuths ...AuthConfig) (*Client, error) {
+	if jumpUser == "" {
+		jumpUser = user
+	}
+	if jumpPort == 0 {
+		jumpPort = 22
+	}
+	jumpAuth := auth
+	if len(jumpAuths) > 0 {
+		jumpAuth = jumpAuths[0]
+	}
+	jump, err := ConnectWithTimeout(jumpUser, jumpHost, jumpPort, jumpAuth, timeout)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to proxy jump %s: %w", jumpHost, err)
+	}
+	client, err := connectWithTimeout(user, host, port, auth, timeout, jump)
+	if err != nil {
+		_ = jump.Close()
+		return nil, err
+	}
+	return client, nil
+}
+
+func connectWithTimeout(user, host string, port int, auth AuthConfig, timeout time.Duration, jump *Client) (*Client, error) {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
 	var authMethods []ssh.AuthMethod
 
 	if auth.Password != "" {
@@ -82,16 +184,66 @@ func Connect(user, host string, port int, auth AuthConfig) (*Client, error) {
 		User:            user,
 		Auth:            authMethods,
 		HostKeyCallback: hostKeyCallback,
-		Timeout:         10 * time.Second,
+		Timeout:         timeout,
 	}
 
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
-	goClient, err := ssh.Dial("tcp", addr, config)
+	var goClient *ssh.Client
+	if jump == nil {
+		goClient, err = ssh.Dial("tcp", addr, config)
+	} else {
+		dialCh := make(chan struct {
+			conn    net.Conn
+			dialErr error
+		}, 1)
+		go func() {
+			conn, dialErr := jump.GoClient.Dial("tcp", addr)
+			dialCh <- struct {
+				conn    net.Conn
+				dialErr error
+			}{conn, dialErr}
+		}()
+		var conn net.Conn
+		var dialErr error
+		select {
+		case result := <-dialCh:
+			conn, dialErr = result.conn, result.dialErr
+		case <-time.After(timeout):
+			_ = jump.Close()
+			// The SSH client's Dial call runs in a goroutine. Drain its result
+			// so a connection that races the timeout is closed instead of leaked.
+			go func() {
+				result := <-dialCh
+				if result.conn != nil {
+					_ = result.conn.Close()
+				}
+			}()
+			dialErr = fmt.Errorf("proxy target dial timeout after %s", timeout)
+		}
+		if dialErr == nil {
+			// ProxyJump's Dial only establishes the TCP stream; unlike ssh.Dial,
+			// it does not apply ClientConfig.Timeout to the subsequent SSH
+			// handshake. Bound the handshake explicitly and clear the deadline
+			// once authentication completes so the connection remains usable.
+			_ = conn.SetDeadline(time.Now().Add(timeout))
+			cc, chans, reqs, handshakeErr := ssh.NewClientConn(conn, addr, config)
+			if handshakeErr == nil {
+				_ = conn.SetDeadline(time.Time{})
+			}
+			if handshakeErr != nil {
+				_ = conn.Close()
+				dialErr = handshakeErr
+			} else {
+				goClient = ssh.NewClient(cc, chans, reqs)
+			}
+		}
+		err = dialErr
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to %s: %w", addr, err)
 	}
 
-	return &Client{GoClient: goClient}, nil
+	return &Client{GoClient: goClient, upstream: jump}, nil
 }
 
 // Close closes the SSH connection.
@@ -103,7 +255,13 @@ func (c *Client) Close() error {
 	c.mu.Unlock()
 
 	if client != nil {
-		return client.Close()
+		err := client.Close()
+		if c.upstream != nil {
+			if upstreamErr := c.upstream.Close(); err == nil {
+				err = upstreamErr
+			}
+		}
+		return err
 	}
 	return nil
 }

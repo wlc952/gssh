@@ -2,7 +2,7 @@
 
 gssh 是一个为 AI Agent 设计的 SSH/本地会话管理和命令执行工具。借鉴 tmux 的 client-server 架构（单一二进制，daemon 按需自启），**CLI 用法与 ssh/scp 对齐**：`gssh user@host -p 7080` 连接、`gssh user@host "cmd"` 直接执行、`gssh scp file session:/path` 传文件。默认使用 ssh-agent 和 `~/.ssh` 默认密钥认证。
 
-**设计原则：完全非交互、纯脚本化。所有参数通过命令行传递，不依赖 TTY。**
+**设计原则：完全非交互、纯脚本化。不依赖 TTY；密码既可显式传参，也可通过 `--password-stdin` 安全注入。**
 
 ## 为什么 Agent 应该用 gssh 而不是直接 SSH？
 
@@ -25,6 +25,13 @@ Agent（AI agent、自动化脚本）通过 gssh 执行远程命令比直接调�
 | **端口转发** | 需保持 SSH 进程存活 | 断线后转发继续工作，重连后转发自动恢复 |
 | **TTY 依赖** | 很多 SSH 操作隐式依赖 PTY | 完全非交互，不需要 TTY，适合 agent 程序化调用 |
 | **远端零配置** | — | 远端仅需标准 SSH 服务，无需安装任何额外软件 |
+
+密码不建议直接写在命令行（可能出现在 shell 历史或进程列表）。连接或重连时可通过管道安全传入：
+
+```bash
+printf '%s\n' "$GSSH_PASSWORD" | gssh connect admin@host --password-stdin
+printf '%s\n' "$GSSH_PASSWORD" | gssh use production --password-stdin
+```
 
 **核心要点**：gssh 把"SSH 连接"从"每条命令的生命周期"中解耦出来——连接由 daemon 持久管理，命令在已有连接上执行。这让 agent 不再需要处理连接建立、断线重试、输出解析等底层问题。
 
@@ -258,13 +265,13 @@ gssh -v
 
 | 命令 | 说明 |
 | --- | --- |
-| `gssh user@host [-p port] [-i key] [--pswd pw] [-n name]` | 连接（创建/复用会话） |
+| `gssh user@host [-p port] [--connect-timeout sec] [-i key] [--pswd pw\|--password-stdin] [-n name]` | 连接（创建/复用会话） |
 | `gssh user@host [flags] "command"` | 连接并执行（复用会话） |
 | `gssh exec [-n name] [-t sec] [--stream] [--raw] [--sudo ...] "cmd"` | 会话内执行（默认 JSON 输出） |
 | `gssh run [flags] "cmd"` | 一次性本地执行 |
 | `gssh local [-n name]` | 创建本地会话 |
 | `gssh list [--json]` | 列出会话 |
-| `gssh use <name> [--pswd pw] [-i key]` | 切换默认 / 重连会话 |
+| `gssh use <name> [--pswd pw\|--password-stdin] [-i key]` | 切换默认 / 重连会话 |
 | `gssh kill <name>` | 关闭会话 |
 | `gssh forward [-n name] -L l:r` | 本地转发 |
 | `gssh forward [-n name] -R r:l [--public]` | 远程转发 |
@@ -272,8 +279,21 @@ gssh -v
 | `gssh forward-close <id>` | 关闭转发（支持前缀） |
 | `gssh scp <src> <dst>` | 传输（一侧为 `session:path`） |
 | `gssh sftp [-n name] ls\|mkdir\|rm <path>` | SFTP 操作 |
+| `gssh completion <bash\|zsh\|fish>` | 生成 shell 补全脚本 |
 | `gssh ping` / `gssh stop` | daemon 健康检查 / 停止 |
 | `-S <socket_path>` | 覆盖 socket 路径（默认：`$XDG_RUNTIME_DIR/gssh/gssh.sock` 或 `~/.gssh/run/gssh.sock`） |
+
+Shell 补全可直接加载或安装到用户配置中：
+
+```bash
+# Bash（当前 shell）
+eval "$(gssh completion bash)"
+# Zsh
+mkdir -p ~/.zsh/completions
+gssh completion zsh > ~/.zsh/completions/_gssh
+# Fish（当前 shell）
+gssh completion fish | source
+```
 
 ## 项目结构
 
@@ -319,6 +339,35 @@ gssh/
 - **缓冲输出上限 4MB**：超过时请使用 `--stream`
 - **首次主机密钥默认不自动信任**：需预先写入 `known_hosts`；仅在显式设置 `GSSH_INSECURE_ACCEPT_NEW_HOST_KEYS=1` 时启用自动接收
 
+## P0 可靠性改进
+
+- `--connect-timeout` 只控制 SSH 建连和认证；`-t` 只控制命令执行，两者互不影响。
+- 所有 RPC 错误都包含 `code`、`message`、`retryable`、`session` 和 `task_id` 字段，便于 Agent 分类重试和关联日志。
+- 流式命令的客户端断开会触发服务端清理：本地命令会终止整个进程组，远程命令会关闭 SSH session，避免留下孤儿任务。
+- 流式命令会显示可复用的任务 ID；可从另一终端执行 `gssh cancel <task_id>` 主动取消。
+- `gssh tasks` 可查看当前运行中的流式任务。
+
+## P1 使用能力
+
+- 批量执行：`gssh batch -f hosts.txt --parallel 16 -- "uname -a"`，默认输出按主机排列的 JSON Lines。
+- SSH 配置别名：自动读取 `~/.ssh/config` 中的 `Host`、`HostName`、`User`、`Port` 和 `IdentityFile`；命令行显式参数优先。
+- 命令上下文：`--cwd /path` 设置本地或远程命令工作目录，`-e KEY=VALUE` 注入环境变量。
+- 输入与跳板：`--stdin-file input.txt` 或 `--stdin` 向非流式命令提供标准输入；`~/.ssh/config` 的 `ProxyJump` 支持单跳连接。
+- 文件传输会在目标文件是源文件严格前缀时自动续传，已完成文件仍按大小和修改时间跳过。
+
+## P2 开发者体验
+
+- 生成补全脚本：`gssh completion bash`、`gssh completion zsh`、`gssh completion fish`。
+- 机器可读帮助：`gssh help --json`，适合 IDE、Agent 和脚本发现命令与参数。
+- 当前保持无 TTY 的执行模型；交互式 shell 请使用 OpenSSH、tmux 或 mosh。
+
+## 应用场景与路线
+
+gssh 主要服务于 AI Agent、CI/CD Runner、SRE 运维脚本和开发者工具：这些调用方需要
+可预测的 JSON/流式结果、连接复用、断线恢复和审计，而不需要在远端安装额外 Agent。
+与 OpenSSH、tmux、mosh、Ansible 等工具的边界，以及批量执行、任务取消、安全凭据和
+可观测性等后续改进，详见 [SCENARIOS.md](SCENARIOS.md)。
+
 ## 从 v0.2 迁移
 
 v0.3 将 CLI 与 ssh 对齐，存在破坏性变更：
@@ -336,6 +385,18 @@ v0.3 将 CLI 与 ssh 对齐，存在破坏性变更：
 | `gssh exec --json "cmd"` | 默认即 JSON（`--json` 保留兼容）；需要原始输出用 `--raw` |
 
 ## 开发
+
+### Per-command environment
+
+Use repeatable `-e KEY=VALUE` (or `--env`) flags with `exec`, `run`, and
+ssh-style commands to inject environment variables into the command shell:
+
+```sh
+gssh exec -n production -e APP_ENV=staging -e 'MESSAGE=hello world' 'echo "$APP_ENV: $MESSAGE"'
+gssh admin@example.com -e RELEASE=2026-09-29 ./deploy.sh
+```
+
+Values are shell-quoted safely and apply to streamed and sudo commands too.
 
 ```bash
 # 构建

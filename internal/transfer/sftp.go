@@ -1,6 +1,7 @@
 package transfer
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -260,11 +261,49 @@ func (s *sftpSession) uploadFile(localPath, remotePath string) (int64, error) {
 		return 0, fmt.Errorf("failed to create remote parent directory: %w", err)
 	}
 
-	remoteFile, err := s.client.Create(remotePath)
+	// Resume an interrupted upload when the remote file is a strict prefix of
+	// the local file. A larger or equal remote file is restarted to avoid
+	// silently producing corrupted content.
+	var offset int64
+	if info, statErr := s.client.Stat(remotePath); statErr == nil && info.Size() > 0 && info.Size() < localInfo.Size() {
+		// A size-only check is insufficient: an unrelated shorter remote file
+		// would otherwise be appended to and silently corrupt the result. Verify
+		// that the remote bytes are an exact prefix of the local file first.
+		remoteRead, openErr := s.client.Open(remotePath)
+		if openErr != nil {
+			return 0, fmt.Errorf("failed to open remote file for resume verification: %w", openErr)
+		}
+		equal, verifyErr := verifyRemotePrefix(localFile, remoteRead, info.Size())
+		closeErr := remoteRead.Close()
+		if verifyErr != nil {
+			return 0, fmt.Errorf("failed to verify remote prefix: %w", verifyErr)
+		}
+		if closeErr != nil {
+			return 0, fmt.Errorf("failed to close remote file after resume verification: %w", closeErr)
+		}
+		if equal {
+			offset = info.Size()
+		}
+	}
+	flags := os.O_WRONLY | os.O_CREATE
+	if offset == 0 {
+		flags |= os.O_TRUNC
+	}
+	remoteFile, err := s.client.OpenFile(remotePath, flags)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create remote file: %w", err)
 	}
 	defer remoteFile.Close()
+	// Prefix verification may have advanced localFile even when resume is
+	// rejected; always position it at the actual copy offset.
+	if _, err := localFile.Seek(offset, io.SeekStart); err != nil {
+		return 0, err
+	}
+	if offset > 0 {
+		if _, err := remoteFile.Seek(offset, io.SeekStart); err != nil {
+			return 0, err
+		}
+	}
 
 	written, err := io.Copy(remoteFile, localFile)
 	if err != nil {
@@ -275,6 +314,41 @@ func (s *sftpSession) uploadFile(localPath, remotePath string) (int64, error) {
 		return 0, fmt.Errorf("failed to preserve remote mode: %w", err)
 	}
 	return written, nil
+}
+
+// verifyRemotePrefix reports whether the first n bytes of remote match the
+// first n bytes of local. Both files are rewound before reading and local is
+// rewound again by the caller's subsequent seek when a resume is selected.
+func verifyRemotePrefix(local, remote io.ReadSeeker, n int64) (bool, error) {
+	if n <= 0 {
+		return true, nil
+	}
+	if _, err := local.Seek(0, io.SeekStart); err != nil {
+		return false, err
+	}
+	if _, err := remote.Seek(0, io.SeekStart); err != nil {
+		return false, err
+	}
+	const chunkSize = 32 * 1024
+	lbuf := make([]byte, chunkSize)
+	rbuf := make([]byte, chunkSize)
+	remaining := n
+	for remaining > 0 {
+		want := int64(chunkSize)
+		if remaining < want {
+			want = remaining
+		}
+		ln, lerr := io.ReadFull(local, lbuf[:want])
+		rn, rerr := io.ReadFull(remote, rbuf[:want])
+		if ln != rn || !bytes.Equal(lbuf[:ln], rbuf[:rn]) {
+			return false, nil
+		}
+		if lerr != nil || rerr != nil {
+			return false, fmt.Errorf("short read while verifying prefix (local: %v, remote: %v)", lerr, rerr)
+		}
+		remaining -= want
+	}
+	return true, nil
 }
 
 func (s *sftpSession) Download(remotePath, localPath string) (int64, error) {
@@ -373,6 +447,54 @@ func (s *sftpSession) downloadFile(remotePath string, root *safeRoot, relPath st
 	}
 	defer remoteFile.Close()
 
+	remoteInfo, _ := s.client.Stat(remotePath)
+	var offset int64
+	// Continue a partial local file when it is smaller than the remote file.
+	// A larger/equal local file is restarted to guarantee correct contents.
+	if remoteInfo != nil {
+		if existing, statErr := root.openFileResume(relPath, 0600); statErr == nil {
+			if st, e := existing.Stat(); e == nil && st.Size() > 0 && st.Size() < remoteInfo.Size() {
+				// A size-only check is unsafe: the local file may be stale or
+				// unrelated. Resume only when its bytes exactly match the remote
+				// file's prefix; otherwise restart from the beginning.
+				equal, verifyErr := verifyRemotePrefix(existing, remoteFile, st.Size())
+				if verifyErr != nil {
+					existing.Close()
+					return 0, fmt.Errorf("failed to verify local prefix: %w", verifyErr)
+				}
+				if equal {
+					offset = st.Size()
+				}
+			}
+			existing.Close()
+		}
+	}
+	if offset > 0 {
+		localFile, err := root.openFileResume(relPath, 0600)
+		if err != nil {
+			return 0, fmt.Errorf("failed to open local file: %w", err)
+		}
+		if _, err = localFile.Seek(offset, io.SeekStart); err != nil {
+			localFile.Close()
+			return 0, err
+		}
+		if _, err = remoteFile.Seek(offset, io.SeekStart); err != nil {
+			localFile.Close()
+			return 0, err
+		}
+		defer localFile.Close()
+		written, err := io.Copy(localFile, remoteFile)
+		if err != nil {
+			return 0, fmt.Errorf("failed to download file: %w", err)
+		}
+		if remoteInfo != nil {
+			_ = localFile.Chmod(remoteInfo.Mode())
+		}
+		if err := setFileTimes(localFile, modTime); err != nil {
+			return 0, err
+		}
+		return written, nil
+	}
 	localFile, err := root.openFile(relPath, 0600)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create local file: %w", err)
@@ -384,9 +506,9 @@ func (s *sftpSession) downloadFile(remotePath string, root *safeRoot, relPath st
 		return 0, fmt.Errorf("failed to download file: %w", err)
 	}
 
-	remoteInfo, err := s.client.Stat(remotePath)
+	remoteInfo2, err := s.client.Stat(remotePath)
 	if err == nil {
-		if chmodErr := localFile.Chmod(remoteInfo.Mode()); chmodErr != nil {
+		if chmodErr := localFile.Chmod(remoteInfo2.Mode()); chmodErr != nil {
 			return 0, fmt.Errorf("failed to preserve local mode: %w", chmodErr)
 		}
 	}

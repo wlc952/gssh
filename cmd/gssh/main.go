@@ -36,6 +36,12 @@ func main() {
 	}
 
 	if len(args) > 0 && (args[0] == "-h" || args[0] == "--help") {
+		for _, arg := range args[1:] {
+			if arg == "--json" {
+				printJSONUsage()
+				return
+			}
+		}
 		printUsage()
 		os.Exit(0)
 	}
@@ -66,11 +72,19 @@ func main() {
 		err = handleLocal(subArgs)
 	case "kill":
 		err = handleKill(subArgs)
+	case "cancel":
+		err = handleCancel(subArgs)
+	case "tasks":
+		err = handleTasks(subArgs)
+	case "batch":
+		err = handleBatch(subArgs)
 	case "exec":
 		err = handleExec(subArgs)
 	case "run":
 		err = handleRun(subArgs)
 	case "list", "ls":
+		err = handleList(subArgs)
+	case "status":
 		err = handleList(subArgs)
 	case "use":
 		err = handleUse(subArgs)
@@ -89,7 +103,17 @@ func main() {
 	case "stop":
 		err = handleStop()
 	case "help":
+		for _, arg := range subArgs {
+			if arg == "--json" {
+				printJSONUsage()
+				return
+			}
+		}
 		printUsage()
+	case "completion":
+		// Completion only emits a script and must never auto-start the daemon.
+		allowAutoStart = false
+		err = handleCompletion(subArgs)
 	default:
 		// ssh-style shorthand: `gssh user@host [flags] [command...]`
 		if strings.Contains(cmd, "@") {
@@ -111,20 +135,23 @@ func printUsage() {
 	fmt.Printf(`gssh - SSH session multiplexer for agents v%s
 
 Usage (ssh-style):
-  gssh user@host [-p port] [-i key] [--pswd pw] [-n name]      Connect (creates session)
-  gssh user@host [-p port] [flags] "command"                   Connect if needed, then exec
-  gssh connect user@host [-p port] [-i key] [--pswd pw]        Same, explicit subcommand
+  gssh user@host [-p port] [-i key] [--pswd pw|--password-stdin] [-n name] Connect (creates session)
+  gssh user@host [-p port] [-e KEY=VALUE] [flags] "command"   Connect if needed, then exec
+  gssh connect user@host [-p port] [-i key] [--pswd pw|--password-stdin] Same, explicit subcommand
 
   Auth: with no flags, tries ssh-agent then ~/.ssh default keys
   (id_ed25519, id_ecdsa, id_rsa) — just like ssh. Use --pswd for password.
 
 Session commands:
   gssh local [-n name]                           Create local session
-  gssh exec [-n name] [-t timeout] [--stream] [--raw] [--sudo ...] "command"
-  gssh run [-t timeout] [--stream] [--raw] [--sudo ...] "command"  One-off local exec
-  gssh list | ls [--json]                        List sessions
-  gssh use <name> [--pswd pw] [-i key]           Switch default / reconnect session
+  gssh exec [-n name] [-t timeout] [-e KEY=VALUE] [--stream] [--raw] [--sudo ...] "command"
+  gssh run [-t timeout] [-e KEY=VALUE] [--stream] [--raw] [--sudo ...] "command"  One-off local exec
+  gssh list | ls | status [--json]               List session status
+  gssh use <name> [--pswd pw|--password-stdin] [-i key] Switch default / reconnect session
   gssh kill [-n name]                            Kill session
+  gssh cancel <task_id>                          Cancel a running streamed command
+  gssh tasks                                     List running streamed commands
+  gssh batch -f hosts --parallel 16 -- "uname -a"  Execute on hosts concurrently (JSON lines)
 
 Transfers & forwards (scp/ssh-style):
   gssh scp <src> <dst>                           One side is session:path (upload or download)
@@ -138,16 +165,19 @@ Transfers & forwards (scp/ssh-style):
 Daemon:
   gssh start | stop | ping                       Daemon starts automatically when needed
   gssh server                                    Run daemon in foreground (internal)
+  gssh completion <bash|zsh|fish>                Generate shell completion script
   gssh -v, --version
   gssh -S <socket_path> ...                      Override socket (default: %s)
 
 Exec options:
   -t timeout        Command timeout in seconds
   --stream          Stream stdout/stderr in real-time (for long-running commands)
+  --task-id         Optional task ID, printed for streamed cancellation
   --raw             Raw stdout/stderr instead of the default JSON result
   --sudo            Run with sudo (password via stdin, no shell injection)
   --pswd            Sudo password (on connect: SSH password; doubles as sudo
                     password in the user@host shorthand when --sudo is set)
+  --password-stdin  Read SSH password from stdin (safer for scripts; connect/use)
   --sudo-user       Run as specified user
   --sudo-login      Login shell (-i)
 

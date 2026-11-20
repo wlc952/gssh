@@ -71,6 +71,38 @@ func (r *safeRoot) openFile(relPath string, perm os.FileMode) (*os.File, error) 
 	return file, nil
 }
 
+// openFileResume opens a destination without truncating existing content.
+func (r *safeRoot) openFileResume(relPath string, perm os.FileMode) (*os.File, error) {
+	cleanRel, err := cleanRelPath(relPath)
+	if err != nil {
+		return nil, err
+	}
+	if cleanRel == "" {
+		return nil, fmt.Errorf("invalid destination relative path: %s", relPath)
+	}
+	if err := r.ensureDir(filepath.Dir(cleanRel), 0755); err != nil {
+		return nil, err
+	}
+	parentFD, err := r.openDir(filepath.Dir(cleanRel))
+	if err != nil {
+		return nil, err
+	}
+	if parentFD != r.fd {
+		defer unix.Close(parentFD)
+	}
+	name := filepath.Base(cleanRel)
+	fd, err := unix.Openat(parentFD, name, unix.O_CREAT|unix.O_WRONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, uint32(perm.Perm()))
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), cleanRel)
+	if f == nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("failed to wrap destination file descriptor")
+	}
+	return f, nil
+}
+
 // ensureDir creates relPath (and any missing parents) under the root,
 // refusing to follow symlinks.
 func (r *safeRoot) ensureDir(relPath string, mode os.FileMode) error {

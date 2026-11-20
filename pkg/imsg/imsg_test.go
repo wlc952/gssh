@@ -2,8 +2,42 @@ package imsg
 
 import (
 	"bytes"
+	"io"
 	"testing"
 )
+
+type shortWriter struct {
+	b bytes.Buffer
+	n int
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if len(p) > w.n {
+		p = p[:w.n]
+	}
+	return w.b.Write(p)
+}
+
+func TestWriteHandlesShortWrites(t *testing.T) {
+	w := &shortWriter{n: 2}
+	want := NewImsg(42, []byte("payload"))
+	if err := WriteMessage(w, want); err != nil {
+		t.Fatalf("WriteMessage failed: %v", err)
+	}
+	got, err := ReadMessage(&w.b)
+	if err != nil {
+		t.Fatalf("ReadMessage failed after short writes: %v", err)
+	}
+	if got.Type != want.Type || string(got.Payload) != string(want.Payload) {
+		t.Fatalf("round trip mismatch: got type=%d payload=%q", got.Type, got.Payload)
+	}
+}
+
+func TestWriteNilMessage(t *testing.T) {
+	if err := WriteMessage(io.Discard, nil); err == nil {
+		t.Fatal("expected error for nil message")
+	}
+}
 
 func TestWriteAndRead(t *testing.T) {
 	payload := []byte(`{"user":"admin","host":"10.0.1.1"}`)

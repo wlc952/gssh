@@ -55,6 +55,9 @@ func ReadMessage(r io.Reader) (*Imsg, error) {
 
 // WriteMessage writes an imsg frame to the writer.
 func WriteMessage(w io.Writer, msg *Imsg) error {
+	if msg == nil {
+		return fmt.Errorf("cannot write nil message")
+	}
 	if len(msg.Payload) > MaxPayloadSize {
 		return fmt.Errorf("payload too large: %d bytes (max %d)", len(msg.Payload), MaxPayloadSize)
 	}
@@ -64,16 +67,36 @@ func WriteMessage(w io.Writer, msg *Imsg) error {
 	binary.BigEndian.PutUint16(header[1:3], msg.Type)
 	binary.BigEndian.PutUint32(header[3:7], uint32(len(msg.Payload)))
 
-	if _, err := w.Write(header); err != nil {
+	if err := writeFull(w, header); err != nil {
 		return fmt.Errorf("failed to write header: %w", err)
 	}
 
 	if len(msg.Payload) > 0 {
-		if _, err := w.Write(msg.Payload); err != nil {
+		if err := writeFull(w, msg.Payload); err != nil {
 			return fmt.Errorf("failed to write payload: %w", err)
 		}
 	}
 
+	return nil
+}
+
+// writeFull handles writers that legally perform short writes without
+// returning an error. This matters for wrappers around sockets and buffered
+// writers: emitting a partial frame would desynchronise every subsequent
+// message on the connection.
+func writeFull(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if n > 0 {
+			p = p[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
 	return nil
 }
 

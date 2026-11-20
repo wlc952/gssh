@@ -2,9 +2,11 @@ package server
 
 import (
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"gssh/internal/audit"
 	"gssh/internal/protocol"
@@ -27,6 +29,38 @@ func TestStopIsIdempotent(t *testing.T) {
 	if err := srv.Stop(); err != nil {
 		t.Fatalf("second Stop failed: %v", err)
 	}
+}
+
+func TestMonitorConnDisconnectCancelsQuietStream(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	cancel := make(chan struct{})
+	done := make(chan struct{})
+	monitorDone := make(chan struct{})
+	go monitorConnDisconnect(serverConn, cancel, done, monitorDone)
+	_ = clientConn.Close()
+	select {
+	case <-cancel:
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection disconnect did not cancel stream")
+	}
+	close(done)
+	<-monitorDone
+	_ = serverConn.Close()
+}
+
+func TestRegisterTaskRejectsDuplicateID(t *testing.T) {
+	s := NewServer(filepath.Join(t.TempDir(), "gssh.sock"))
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	first, err := s.registerTask("same", serverConn)
+	if err != nil || first == nil {
+		t.Fatalf("first registration failed: %v", err)
+	}
+	if second, err := s.registerTask("same", serverConn); err == nil || second != nil {
+		t.Fatalf("duplicate registration should fail, got cancel=%v err=%v", second, err)
+	}
+	s.unregisterTask("same", serverConn)
 }
 
 func TestLogExecAuditRecordsExitCode(t *testing.T) {

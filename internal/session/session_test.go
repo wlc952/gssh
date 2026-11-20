@@ -89,6 +89,21 @@ func TestUseSetsDefaultOnNewSession(t *testing.T) {
 	}
 }
 
+func TestListReturnsStableNameOrder(t *testing.T) {
+	m := NewManager()
+	for _, name := range []string{"zeta", "alpha", "middle"} {
+		if _, err := m.ConnectLocal(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := m.List()
+	for i, want := range []string{"alpha", "middle", "zeta"} {
+		if got[i].GetName() != want {
+			t.Fatalf("List()[%d] = %q, want %q", i, got[i].GetName(), want)
+		}
+	}
+}
+
 func TestKill(t *testing.T) {
 	m := NewManager()
 	_, _ = m.ConnectLocal("local")
@@ -160,5 +175,22 @@ func TestAwaitClientReturnsWhenConnected(t *testing.T) {
 
 	if _, err := sess.AwaitClient(5 * time.Second); err != nil {
 		t.Fatalf("expected client, got %v", err)
+	}
+}
+
+func TestOfflineReconnectUsesRequestedTimeout(t *testing.T) {
+	m := NewManager()
+	sess := &SSHSession{Name: "u@host", User: "u", Host: "host", Port: 22, Status: StatusOffline, CreatedAt: time.Now()}
+	m.sessions[sess.Name] = sess
+	var got time.Duration
+	m.SetConnectFuncWithTimeout(func(user, host string, port int, auth sshclient.AuthConfig, timeout time.Duration) (*sshclient.Client, error) {
+		got = timeout
+		return &sshclient.Client{}, nil
+	})
+	if _, err := m.ConnectSSHWithTimeout(sess.Name, sess.User, sess.Host, sess.Port, "", "", 3); err != nil {
+		t.Fatalf("reconnect failed: %v", err)
+	}
+	if got != 3*time.Second {
+		t.Fatalf("timeout = %v, want 3s", got)
 	}
 }

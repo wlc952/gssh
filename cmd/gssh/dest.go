@@ -32,6 +32,33 @@ func parseDestination(dest string) (string, string, error) {
 	return u, h, nil
 }
 
+// validatePort validates TCP ports accepted by the CLI. Keeping this check at
+// the boundary avoids confusing connection errors from the daemon for values
+// that can never be valid on the wire.
+func validatePort(port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("invalid port %d: must be between 1 and 65535", port)
+	}
+	return nil
+}
+
+// validateTimeout accepts zero for an unlimited command and positive values
+// in seconds. Negative values are almost always a typo and must be rejected
+// instead of silently becoming unlimited.
+func validateTimeout(timeout int) error {
+	if timeout < 0 {
+		return fmt.Errorf("invalid timeout %d: must be zero (unlimited) or positive seconds", timeout)
+	}
+	return nil
+}
+
+func shortID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
+}
+
 // handleDestination implements the ssh-style shorthand:
 //
 //	gssh user@host [flags]                → connect (create/reuse session)
@@ -46,16 +73,37 @@ func handleDestination(dest string, args []string) error {
 	port := fs.Int("p", 22, "Port")
 	keyPath := fs.String("i", "", "SSH key path")
 	password := fs.String("pswd", "", "Password (SSH auth; also used for sudo when --sudo is set)")
+	passwordStdin := fs.Bool("password-stdin", false, "Read password from stdin (avoids exposing it in process arguments)")
 	name := fs.String("n", "", "Session name")
 	timeout := fs.Int("t", 0, "Timeout in seconds")
+	cwd := fs.String("cwd", "", "Working directory for the command")
+	stdin := fs.Bool("stdin", false, "Pass stdin to command")
+	stdinFile := fs.String("stdin-file", "", "Read command stdin from file")
+	connectTimeout := fs.Int("connect-timeout", 10, "SSH connection/authentication timeout in seconds (0 uses default)")
 	stream := fs.Bool("stream", false, "Stream output in real-time")
 	rawOut := fs.Bool("raw", false, "Print raw stdout/stderr instead of JSON")
 	_ = fs.Bool("json", false, "(deprecated) JSON is the default; kept for compatibility")
 	useSudo := fs.Bool("sudo", false, "Run with sudo")
 	sudoUser := fs.String("sudo-user", "", "Run as specified user")
 	sudoLogin := fs.Bool("sudo-login", false, "Login shell (-i)")
+	var env envFlags
+	fs.Var(&env, "e", "Set environment variable (KEY=VALUE); repeatable")
+	fs.Var(&env, "env", "Set environment variable (KEY=VALUE); repeatable")
 
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	resolvedPassword, err := passwordFromFlags(*password, *passwordStdin)
+	if err != nil {
+		return err
+	}
+	if err := validatePort(*port); err != nil {
+		return err
+	}
+	if err := validateTimeout(*timeout); err != nil {
+		return err
+	}
+	if err := validateTimeout(*connectTimeout); err != nil {
 		return err
 	}
 
@@ -63,17 +111,22 @@ func handleDestination(dest string, args []string) error {
 	if err != nil {
 		return err
 	}
+	var proxyJump string
+	host, userName, *port, *keyPath, proxyJump = applySSHConfig(host, userName, *port, *keyPath,
+		strings.Contains(dest, "@"), flagWasSet(fs, "p"), flagWasSet(fs, "i"))
 
 	params := protocol.ConnectParams{
-		Name:     *name,
-		User:     userName,
-		Host:     host,
-		Port:     *port,
-		Password: *password,
-		KeyPath:  *keyPath,
+		Name:      *name,
+		User:      userName,
+		Host:      host,
+		Port:      *port,
+		Password:  resolvedPassword,
+		KeyPath:   *keyPath,
+		ProxyJump: proxyJump,
+		Timeout:   *connectTimeout,
 	}
 
-	result, err := sendRequestWithTimeout(protocol.MsgConnect, params, connectRPCTimeout)
+	result, err := sendRequestWithTimeout(protocol.MsgConnect, params, connectRPCDeadline(*connectTimeout))
 	if err != nil {
 		return err
 	}
@@ -88,22 +141,33 @@ func handleDestination(dest string, args []string) error {
 		fmt.Printf("Connected: %s@%s (name: %s, type: %s)\n", info.User, info.Host, info.Name, info.Type)
 		return nil
 	}
+	input, err := readCommandStdin(*stdin, *stdinFile)
+	if err != nil {
+		return err
+	}
 
 	// Exec on the (new or existing) session. --pswd doubles as the sudo
 	// password: it is the same account password in the common case.
 	execParams := protocol.ExecParams{
+		TaskID:  newTaskID(),
 		Name:    info.Name,
-		Command: joinCommandArgs(fs.Args()),
+		Command: withEnv(joinCommandArgs(fs.Args()), env),
+		Cwd:     *cwd,
 		Timeout: *timeout,
 		Sudo: protocol.SudoOptions{
 			Enabled:  *useSudo,
-			Password: *password,
+			Password: resolvedPassword,
 			User:     *sudoUser,
 			Login:    *sudoLogin,
 		},
+		Stdin: input,
 	}
 
 	if *stream {
+		if len(input) > 0 {
+			return fmt.Errorf("--stdin/--stdin-file are not supported with --stream")
+		}
+		fmt.Fprintf(os.Stderr, "Task ID: %s\n", execParams.TaskID)
 		return sendStreamRequest(protocol.MsgExecStream, execParams, *timeout)
 	}
 

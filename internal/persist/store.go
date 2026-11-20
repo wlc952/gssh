@@ -22,6 +22,7 @@ type SessionState struct {
 	User      string `json:"user"`
 	Port      int    `json:"port,omitempty"`
 	KeyPath   string `json:"key_path,omitempty"`
+	ProxyJump string `json:"proxy_jump,omitempty"`
 	Status    string `json:"status"`
 	CreatedAt int64  `json:"created_at"` // Unix timestamp
 	// AutoReconnect is true when the session can be re-established after a
@@ -45,7 +46,49 @@ func (s *Store) Save(sessions []SessionState) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal state: %w", err)
 	}
-	return os.WriteFile(s.path, data, 0600)
+
+	// Write to a temporary file in the same directory and atomically rename it
+	// into place. A daemon crash or machine reset during Save must never leave
+	// a truncated state.json that prevents the next daemon from starting.
+	dir := filepath.Dir(s.path)
+	tmp, err := os.CreateTemp(dir, ".state-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary state file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("failed to secure temporary state file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("failed to write state: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("failed to sync state: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary state file: %w", err)
+	}
+	if err := os.Rename(tmpName, s.path); err != nil {
+		return fmt.Errorf("failed to replace state file: %w", err)
+	}
+
+	// Sync the directory so the rename itself survives a sudden restart.
+	if dirFile, err := os.Open(dir); err == nil {
+		syncErr := dirFile.Sync()
+		closeErr := dirFile.Close()
+		if syncErr != nil {
+			return fmt.Errorf("failed to sync state directory: %w", syncErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("failed to close state directory: %w", closeErr)
+		}
+	}
+	return nil
 }
 
 // Load reads session state from disk.
@@ -80,6 +123,7 @@ func SessionToState(sess session.Session) SessionState {
 		sshSess := sess.(*session.SSHSession)
 		state.Port = sshSess.Port
 		state.KeyPath = sshSess.GetKeyPath()
+		state.ProxyJump = sshSess.ProxyJump
 		// Auto-reconnect is possible for anything but password-only auth.
 		state.AutoReconnect = sshSess.GetKeyPath() != "" || sshSess.GetPassword() == ""
 	}

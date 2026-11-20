@@ -1,7 +1,9 @@
 package main
 
 import (
+	"os"
 	"os/user"
+	"path/filepath"
 	"testing"
 )
 
@@ -42,6 +44,21 @@ func TestParseDestination(t *testing.T) {
 		if u != tt.wantUser || h != tt.wantHost {
 			t.Errorf("%s: parseDestination(%q) = (%q, %q), want (%q, %q)", tt.name, tt.dest, u, h, tt.wantUser, tt.wantHost)
 		}
+	}
+}
+
+func TestApplySSHConfigExplicitBatchOptionsWin(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".ssh"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".ssh", "config"), []byte("Host prod\n  HostName configured.example\n  Port 2201\n  IdentityFile ~/.ssh/configured\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	host, _, port, key, _ := applySSHConfig("prod", "deploy", 2022, "/tmp/explicit", true, true, true)
+	if host != "configured.example" || port != 2022 || key != "/tmp/explicit" {
+		t.Fatalf("explicit options were overridden: host=%q port=%d key=%q", host, port, key)
 	}
 }
 
@@ -107,5 +124,35 @@ func TestParseForwardSpec(t *testing.T) {
 		if a != tt.wantA || b != tt.wantB {
 			t.Errorf("%s: parseForwardSpec(%q) = (%d, %d), want (%d, %d)", tt.name, tt.spec, a, b, tt.wantA, tt.wantB)
 		}
+	}
+}
+
+func TestValidateCLIValues(t *testing.T) {
+	for _, port := range []int{1, 22, 65535} {
+		if err := validatePort(port); err != nil {
+			t.Errorf("validatePort(%d) unexpected error: %v", port, err)
+		}
+	}
+	for _, port := range []int{0, -1, 65536} {
+		if err := validatePort(port); err == nil {
+			t.Errorf("validatePort(%d) expected error", port)
+		}
+	}
+	for _, timeout := range []int{0, 1, 3600} {
+		if err := validateTimeout(timeout); err != nil {
+			t.Errorf("validateTimeout(%d) unexpected error: %v", timeout, err)
+		}
+	}
+	if err := validateTimeout(-1); err == nil {
+		t.Error("validateTimeout(-1) expected error")
+	}
+}
+
+func TestShortID(t *testing.T) {
+	if got := shortID("abc"); got != "abc" {
+		t.Fatalf("shortID short value = %q", got)
+	}
+	if got := shortID("123456789"); got != "12345678" {
+		t.Fatalf("shortID long value = %q", got)
 	}
 }

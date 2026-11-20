@@ -22,6 +22,8 @@ const (
 	MsgStop            uint16 = 19 // Stop daemon
 	MsgExecStream      uint16 = 20 // Execute command with streaming output
 	MsgLocalExecStream uint16 = 21 // One-off local exec with streaming output
+	MsgCancel          uint16 = 22 // Cancel a running streaming task
+	MsgTaskList        uint16 = 23 // List running tasks
 )
 
 // Message types: Server → Client (responses)

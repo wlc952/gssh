@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"gssh/internal/protocol"
 	"gssh/internal/socketpath"
+	sshconfig "gssh/internal/ssh"
 )
 
 func handleStart() error {
@@ -55,9 +57,21 @@ func handleConnect(args []string) error {
 	port := fs.Int("p", 22, "Port")
 	keyPath := fs.String("i", "", "SSH key path")
 	password := fs.String("pswd", "", "SSH password (prefer key auth when possible)")
+	passwordStdin := fs.Bool("password-stdin", false, "Read SSH password from stdin (avoids exposing it in process arguments)")
 	name := fs.String("n", "", "Session name")
+	connectTimeout := fs.Int("connect-timeout", 10, "SSH connection/authentication timeout in seconds (0 uses default)")
 
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	resolvedPassword, err := passwordFromFlags(*password, *passwordStdin)
+	if err != nil {
+		return err
+	}
+	if err := validatePort(*port); err != nil {
+		return err
+	}
+	if err := validateTimeout(*connectTimeout); err != nil {
 		return err
 	}
 
@@ -69,17 +83,22 @@ func handleConnect(args []string) error {
 	if err != nil {
 		return err
 	}
+	var proxyJump string
+	host, user, *port, *keyPath, proxyJump = applySSHConfig(host, user, *port, *keyPath,
+		strings.Contains(fs.Arg(0), "@"), flagWasSet(fs, "p"), flagWasSet(fs, "i"))
 
 	params := protocol.ConnectParams{
-		Name:     *name,
-		User:     user,
-		Host:     host,
-		Port:     *port,
-		Password: *password,
-		KeyPath:  *keyPath,
+		Name:      *name,
+		User:      user,
+		Host:      host,
+		Port:      *port,
+		Password:  resolvedPassword,
+		KeyPath:   *keyPath,
+		ProxyJump: proxyJump,
+		Timeout:   *connectTimeout,
 	}
 
-	result, err := sendRequestWithTimeout(protocol.MsgConnect, params, connectRPCTimeout)
+	result, err := sendRequestWithTimeout(protocol.MsgConnect, params, connectRPCDeadline(*connectTimeout))
 	if err != nil {
 		return err
 	}
@@ -91,6 +110,36 @@ func handleConnect(args []string) error {
 
 	fmt.Printf("Connected: %s@%s (name: %s, type: %s)\n", info.User, info.Host, info.Name, info.Type)
 	return nil
+}
+
+func flagWasSet(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
+func applySSHConfig(host, user string, port int, key string, userSet, portSet, keySet bool) (string, string, int, string, string) {
+	c, err := sshconfig.ResolveHostConfig(host)
+	if err != nil {
+		return host, user, port, key, ""
+	}
+	if c.HostName != "" {
+		host = c.HostName
+	}
+	if !userSet && c.User != "" {
+		user = c.User
+	}
+	if !portSet && c.Port != 0 {
+		port = c.Port
+	}
+	if !keySet && c.IdentityFile != "" {
+		key = c.IdentityFile
+	}
+	return host, user, port, key, c.ProxyJump
 }
 
 func handleLocal(args []string) error {
@@ -122,8 +171,13 @@ func handleUse(args []string) error {
 	fs := flag.NewFlagSet("use", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	password := fs.String("pswd", "", "Password (for reconnecting offline session)")
+	passwordStdin := fs.Bool("password-stdin", false, "Read password from stdin (avoids exposing it in process arguments)")
 	keyPath := fs.String("i", "", "SSH key path (for reconnecting offline session)")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	resolvedPassword, err := passwordFromFlags(*password, *passwordStdin)
+	if err != nil {
 		return err
 	}
 
@@ -131,9 +185,9 @@ func handleUse(args []string) error {
 		return fmt.Errorf("session name required")
 	}
 
-	_, err := sendRequestWithTimeout(protocol.MsgUse, protocol.UseParams{
+	_, err = sendRequestWithTimeout(protocol.MsgUse, protocol.UseParams{
 		Name:     fs.Arg(0),
-		Password: *password,
+		Password: resolvedPassword,
 		KeyPath:  *keyPath,
 	}, connectRPCTimeout)
 	if err != nil {
@@ -142,6 +196,23 @@ func handleUse(args []string) error {
 
 	fmt.Printf("Using session: %s\n", fs.Arg(0))
 	return nil
+}
+
+// passwordFromFlags resolves the explicit password options used by connect/use.
+// Reading from stdin keeps credentials out of shell history and process listings;
+// only the trailing line ending is removed so passwords may contain spaces.
+func passwordFromFlags(password string, fromStdin bool) (string, error) {
+	if fromStdin && password != "" {
+		return "", fmt.Errorf("--pswd and --password-stdin cannot be used together")
+	}
+	if !fromStdin {
+		return password, nil
+	}
+	b, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return "", fmt.Errorf("failed to read password from stdin: %w", err)
+	}
+	return strings.TrimSuffix(strings.TrimSuffix(string(b), "\n"), "\r"), nil
 }
 
 func handleKill(args []string) error {
@@ -164,6 +235,47 @@ func handleKill(args []string) error {
 	}
 
 	fmt.Println("Killed")
+	return nil
+}
+
+func handleCancel(args []string) error {
+	if len(args) != 1 || args[0] == "" {
+		return fmt.Errorf("task id required: gssh cancel <task_id>")
+	}
+	_, err := sendRequest(protocol.MsgCancel, protocol.CancelParams{TaskID: args[0]})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Cancellation requested: %s\n", args[0])
+	return nil
+}
+
+func handleTasks(args []string) error {
+	fs := flag.NewFlagSet("tasks", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	jsonOut := fs.Bool("json", false, "Print result as JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("tasks takes no positional arguments")
+	}
+	result, err := sendRequest(protocol.MsgTaskList, nil)
+	if err != nil {
+		return err
+	}
+	var tasks []protocol.TaskInfo
+	if err := json.Unmarshal(result, &tasks); err != nil {
+		return fmt.Errorf("failed to parse tasks: %w", err)
+	}
+	if *jsonOut {
+		b, _ := json.Marshal(tasks)
+		fmt.Println(string(b))
+		return nil
+	}
+	for _, task := range tasks {
+		fmt.Printf("%-24s %s\n", task.TaskID, task.Status)
+	}
 	return nil
 }
 
@@ -201,22 +313,35 @@ func handleExec(args []string) error {
 
 	name := fs.String("n", "", "Session name")
 	timeout := fs.Int("t", 0, "Timeout in seconds")
+	cwd := fs.String("cwd", "", "Working directory for the command")
+	stdin := fs.Bool("stdin", false, "Pass stdin to command")
+	stdinFile := fs.String("stdin-file", "", "Read command stdin from file")
+	taskID := fs.String("task-id", "", "Task ID for cancellation/correlation")
 	useSudo := fs.Bool("sudo", false, "Run with sudo")
 	sudoPassword := fs.String("pswd", "", "Sudo password")
 	sudoUser := fs.String("sudo-user", "", "Run as specified user")
 	sudoLogin := fs.Bool("sudo-login", false, "Login shell (-i)")
 	stream := fs.Bool("stream", false, "Stream output in real-time")
 	rawOut := fs.Bool("raw", false, "Print raw stdout/stderr instead of JSON")
+	var env envFlags
+	fs.Var(&env, "e", "Set environment variable (KEY=VALUE); repeatable")
+	fs.Var(&env, "env", "Set environment variable (KEY=VALUE); repeatable")
 	_ = fs.Bool("json", false, "(deprecated) JSON is the default; kept for compatibility")
 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-
+	if err := validateTimeout(*timeout); err != nil {
+		return err
+	}
 	if fs.NArg() < 1 {
 		return fmt.Errorf("command required")
 	}
-	command := joinCommandArgs(fs.Args())
+	command := withEnv(joinCommandArgs(fs.Args()), env)
+	input, err := readCommandStdin(*stdin, *stdinFile)
+	if err != nil {
+		return err
+	}
 
 	sudoOpts := protocol.SudoOptions{
 		Enabled:  *useSudo,
@@ -226,13 +351,20 @@ func handleExec(args []string) error {
 	}
 
 	params := protocol.ExecParams{
+		TaskID:  taskOrNew(*taskID),
 		Name:    *name,
 		Command: command,
+		Cwd:     *cwd,
 		Timeout: *timeout,
 		Sudo:    sudoOpts,
+		Stdin:   input,
 	}
 
 	if *stream {
+		if len(input) > 0 {
+			return fmt.Errorf("--stdin/--stdin-file are not supported with --stream")
+		}
+		fmt.Fprintf(os.Stderr, "Task ID: %s\n", params.TaskID)
 		return sendStreamRequest(protocol.MsgExecStream, params, *timeout)
 	}
 
@@ -249,22 +381,36 @@ func handleRun(args []string) error {
 	fs.SetOutput(os.Stderr)
 
 	timeout := fs.Int("t", 0, "Timeout in seconds")
+	cwd := fs.String("cwd", "", "Working directory for the command")
+	stdin := fs.Bool("stdin", false, "Pass stdin to command")
+	stdinFile := fs.String("stdin-file", "", "Read command stdin from file")
+	taskID := fs.String("task-id", "", "Task ID for cancellation/correlation")
 	useSudo := fs.Bool("sudo", false, "Run with sudo")
 	sudoPassword := fs.String("pswd", "", "Sudo password")
 	sudoUser := fs.String("sudo-user", "", "Run as specified user")
 	sudoLogin := fs.Bool("sudo-login", false, "Login shell (-i)")
 	stream := fs.Bool("stream", false, "Stream output in real-time")
 	rawOut := fs.Bool("raw", false, "Print raw stdout/stderr instead of JSON")
+	var env envFlags
+	fs.Var(&env, "e", "Set environment variable (KEY=VALUE); repeatable")
+	fs.Var(&env, "env", "Set environment variable (KEY=VALUE); repeatable")
 	_ = fs.Bool("json", false, "(deprecated) JSON is the default; kept for compatibility")
 
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := validateTimeout(*timeout); err != nil {
 		return err
 	}
 
 	if fs.NArg() < 1 {
 		return fmt.Errorf("command required")
 	}
-	command := joinCommandArgs(fs.Args())
+	command := withEnv(joinCommandArgs(fs.Args()), env)
+	input, err := readCommandStdin(*stdin, *stdinFile)
+	if err != nil {
+		return err
+	}
 
 	sudoOpts := protocol.SudoOptions{
 		Enabled:  *useSudo,
@@ -274,12 +420,19 @@ func handleRun(args []string) error {
 	}
 
 	params := protocol.LocalExecParams{
+		TaskID:  taskOrNew(*taskID),
 		Command: command,
+		Cwd:     *cwd,
 		Timeout: *timeout,
 		Sudo:    sudoOpts,
+		Stdin:   input,
 	}
 
 	if *stream {
+		if len(input) > 0 {
+			return fmt.Errorf("--stdin/--stdin-file are not supported with --stream")
+		}
+		fmt.Fprintf(os.Stderr, "Task ID: %s\n", params.TaskID)
 		return sendStreamRequest(protocol.MsgLocalExecStream, params, *timeout)
 	}
 
@@ -289,6 +442,36 @@ func handleRun(args []string) error {
 	}
 
 	return printExecResult(result, *rawOut)
+}
+
+func readCommandStdin(useStdin bool, path string) ([]byte, error) {
+	if useStdin && path != "" {
+		return nil, fmt.Errorf("--stdin and --stdin-file cannot be used together")
+	}
+	if path != "" {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read stdin file: %w", err)
+		}
+		return b, nil
+	}
+	if useStdin {
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return nil, fmt.Errorf("read stdin: %w", err)
+		}
+		return b, nil
+	}
+	return nil, nil
+}
+
+func newTaskID() string { return fmt.Sprintf("task-%d", time.Now().UnixNano()) }
+
+func taskOrNew(id string) string {
+	if id != "" {
+		return id
+	}
+	return newTaskID()
 }
 
 func joinCommandArgs(args []string) string {
@@ -436,9 +619,9 @@ func handleForward(args []string) error {
 		if bind == "" {
 			bind = "127.0.0.1"
 		}
-		fmt.Printf("Forward started: %s %d:%s:%d (ID: %s)\n", info.Type, info.LocalPort, bind, info.RemotePort, info.ID[:8])
+		fmt.Printf("Forward started: %s %d:%s:%d (ID: %s)\n", info.Type, info.LocalPort, bind, info.RemotePort, shortID(info.ID))
 	} else {
-		fmt.Printf("Forward started: %s %d:%d (ID: %s)\n", info.Type, info.LocalPort, info.RemotePort, info.ID[:8])
+		fmt.Printf("Forward started: %s %d:%d (ID: %s)\n", info.Type, info.LocalPort, info.RemotePort, shortID(info.ID))
 	}
 	return nil
 }
@@ -484,7 +667,7 @@ func handleForwards(args []string) error {
 				bind = "127.0.0.1"
 			}
 		}
-		fmt.Printf("%-9s %-15s %-8s %-15s %-6d %d\n", f.ID[:8], f.Session, f.Type, bind, f.LocalPort, f.RemotePort)
+		fmt.Printf("%-9s %-15s %-8s %-15s %-6d %d\n", shortID(f.ID), f.Session, f.Type, bind, f.LocalPort, f.RemotePort)
 	}
 
 	return nil
